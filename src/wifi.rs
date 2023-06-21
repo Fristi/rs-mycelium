@@ -18,96 +18,102 @@ use serde::{Deserialize, Serialize};
 pub enum MyceliumWifiError {
     Esp(EspError),
     Timeout,
-    NoIp
+    NoIp,
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct WifiSettings {
+pub struct MyceliumWifiSettings {
     pub ssid: String<32>,
-    pub password: String<64>
+    pub password: String<64>,
+    pub channel: Option<u8>,
+}
+
+pub struct MyceliumWifiEspConnectionResult<R> {
+    wifi: R,
+    pub channel: Option<u8>,
 }
 
 pub trait MyceliumWifi<R> {
-    fn connect(&self, ssid: &String<32>, psk: &String<64>) -> Result<R, MyceliumWifiError>;
+    fn find_channel(&mut self, ssid: &String<32>) -> Result<Option<u8>, MyceliumWifiError>;
+    fn connect(&mut self, ssid: &String<32>, psk: &String<64>, channel: Option<u8>) -> Result<MyceliumWifiEspConnectionResult<R>, MyceliumWifiError>;
 }
 
 pub struct EspMyceliumWifi {
-    sysloop: EspSystemEventLoop
+    sysloop: EspSystemEventLoop,
+    wifi: EspWifi<'static>,
 }
 
 impl EspMyceliumWifi {
     pub fn new(sysloop: EspSystemEventLoop) -> EspMyceliumWifi {
-        EspMyceliumWifi { sysloop }
+        let modem = unsafe { esp_idf_hal::modem::WifiModem::new() };
+        let mut wifi = EspWifi::new(modem, sysloop.clone(), None).unwrap();
+
+        EspMyceliumWifi { sysloop, wifi }
     }
 }
 
-impl MyceliumWifi<EspWifi<'static>> for EspMyceliumWifi {
-    fn connect(&self, ssid: &String<32>, psk: &String<64>) -> Result<EspWifi<'static>, MyceliumWifiError> {
+impl MyceliumWifi<()> for EspMyceliumWifi {
+    fn find_channel(&mut self, ssid: &String<32>) -> Result<Option<u8>, MyceliumWifiError> {
+        info!("Searching for WiFi network {}", ssid);
 
+        let ap_infos = self.wifi.scan()?;
+        let ours = ap_infos.into_iter().find(|a| a.ssid.eq(ssid));
+
+        if let Some(ours) = ours {
+            info!("Found configured access point {} on channel {}", ssid, ours.channel);
+            Ok(Some(ours.channel))
+        } else {
+            info!("Configured access point {} not found during scanning, will go with unknown channel", ssid);
+            Ok(None)
+        }
+    }
+
+    fn connect(&mut self, ssid: &String<32>, psk: &String<64>, channel: Option<u8>) -> Result<MyceliumWifiEspConnectionResult<()>, MyceliumWifiError> {
         let mut auth_method = AuthMethod::WPA2Personal;
         if psk.is_empty() {
             auth_method = AuthMethod::None;
         }
 
-        let modem = unsafe { esp_idf_hal::modem::WifiModem::new() };
-        let mut wifi = EspWifi::new(modem, self.sysloop.clone(), None)?;
-        info!("Searching for WiFi network {}", ssid);
-
-        let ap_infos = wifi.scan()?;
-        let ours = ap_infos.into_iter().find(|a| a.ssid.eq(ssid));
-        let channel = if let Some(ours) = ours {
-            info!(
-            "Found configured access point {} on channel {}",
-            ssid, ours.channel
-        );
-            Some(ours.channel)
-        } else {
-            info!(
-            "Configured access point {} not found during scanning, will go with unknown channel",
-            ssid
-        );
-            None
+        let preferred_channel = match channel {
+            None => self.find_channel(ssid)?,
+            Some(v) => Some(v)
         };
 
         info!("Setting WiFi configuration");
         let conf = Configuration::Client(ClientConfiguration {
             ssid: ssid.clone(),
             password: psk.clone(),
-            channel,
+            channel: preferred_channel,
             auth_method,
             ..Default::default()
         });
 
-        wifi.set_configuration(&conf)?;
-
-        info!("Getting WiFi status");
-        wifi.start()?;
+        self.wifi.set_configuration(&conf)?;
+        self.wifi.start()?;
 
         let wait = WifiWait::new(&self.sysloop)?;
 
-        if !wait.wait_with_timeout(Duration::from_secs(20), || wifi.is_started().unwrap()) {
-            return Err(MyceliumWifiError::Timeout)
+        if !wait.wait_with_timeout(Duration::from_secs(20), || self.wifi.is_started().unwrap()) {
+            return Err(MyceliumWifiError::Timeout);
         }
 
-        info!("Started");
+        self.wifi.connect()?;
 
-        wifi.connect()?;
+        if !EspNetifWait::new::<EspNetif>(self.wifi.sta_netif(), &self.sysloop)?.wait_with_timeout(
+            Duration::from_secs(10),
+            || {
+                let connected = self.wifi.is_connected().unwrap();
+                let ip_info = self.wifi.sta_netif().get_ip_info().unwrap();
 
-        if !EspNetifWait::new::<EspNetif>(wifi.sta_netif(), &self.sysloop)?.wait_with_timeout(
-                Duration::from_secs(10),
-                || {
-                    let connected= wifi.is_connected().unwrap();
-                    let ip_info =  wifi.sta_netif().get_ip_info().unwrap();
+                info!("Status: {:?} {:?}", connected, ip_info);
 
-                    info!("Status: {:?} {:?}", connected, ip_info);
-
-                    connected && ip_info.ip != Ipv4Addr::new(0, 0, 0, 0)
-                },
-            ) {
-            return Err(MyceliumWifiError::NoIp)
+                connected && ip_info.ip != Ipv4Addr::new(0, 0, 0, 0)
+            },
+        ) {
+            return Err(MyceliumWifiError::NoIp);
         }
 
-        Ok(wifi)
+        Ok(MyceliumWifiEspConnectionResult { wifi: (), channel: preferred_channel })
     }
 }
 

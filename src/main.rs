@@ -13,8 +13,8 @@ use embedded_svc::wifi::Wifi;
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
-use esp_idf_sys::esp_restart;
-use crate::wifi::{EspMyceliumWifi, MyceliumWifiError, MyceliumWifi, WifiSettings};
+use esp_idf_sys::{esp_deep_sleep, esp_deep_sleep_start, esp_restart};
+use crate::wifi::{EspMyceliumWifi, MyceliumWifiError, MyceliumWifi, MyceliumWifiSettings};
 use heapless::String;
 use crate::kv::{KvStore, NvsKvsStore};
 
@@ -30,14 +30,16 @@ fn main() -> ! {
     let nvs = EspDefaultNvs::new(nvs_partition, "mycelium", true).unwrap();
 
     let mut kv = NvsKvsStore::new(nvs);
-    let wifi_connector = EspMyceliumWifi::new(sysloop);
+    let mut wifi_connector = EspMyceliumWifi::new(sysloop);
 
 
-    let wifi_settings: Option<WifiSettings> = kv.get("wifi_settings").unwrap();
+    let wifi_settings: Option<MyceliumWifiSettings> = kv.get("wifi_settings").unwrap();
+    let wifi_is_setup = wifi_settings.is_some();
+    let mut elapsed = 0;
 
     match wifi_settings {
         Some(s) => {
-            let _ = wifi_connector.connect(&s.ssid, &s.password).unwrap();
+            let _ = wifi_connector.connect(&s.ssid, &s.password, s.channel).unwrap();
         },
         None => {
             wifi_setup(wifi_connector, kv)
@@ -46,6 +48,15 @@ fn main() -> ! {
 
     loop {
         std::thread::sleep(Duration::from_millis(100));
+        elapsed += 100;
+
+        if wifi_is_setup && elapsed >= 60000 {
+            // 60 seconds
+            unsafe {
+                esp_deep_sleep(60000000000);
+                esp_deep_sleep_start();
+            }
+        }
     }
 }
 
@@ -159,10 +170,10 @@ impl <W, N> ImprovHandler<W, N> {
                     *self.error.write().unwrap() = ImprovError::None;
                     *self.state.write().unwrap() = ImprovState::Provisioning;
 
-                    match self.wifi.connect(&ssid, &password) {
-                        Ok(_) => {
+                    match self.wifi.connect(&ssid, &password, None) {
+                        Ok(res) => {
                             *self.state.write().unwrap() = ImprovState::Provisioned;
-                            self.settings.set("wifi_settings", WifiSettings { ssid, password}).unwrap();
+                            self.settings.set("wifi_settings", MyceliumWifiSettings { ssid, password, channel: res.channel }).unwrap();
                             unsafe { esp_restart() }
                         }
                         Err(wifi_err) => {
