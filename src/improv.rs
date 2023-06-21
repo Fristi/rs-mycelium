@@ -4,7 +4,7 @@ use num_enum::IntoPrimitive;
 #[derive(Debug, PartialEq, Copy, Clone)]
 #[derive(IntoPrimitive)]
 #[repr(u8)]
-pub enum Error {
+pub enum ImprovError {
     None = 0x00,
     InvalidRpc = 0x01,
     UnknownRpc = 0x02,
@@ -16,7 +16,7 @@ pub enum Error {
 
 #[derive(IntoPrimitive, Copy, Clone)]
 #[repr(u8)]
-pub enum State {
+pub enum ImprovState {
     Stopped = 0x00,
     AwaitingAuthorization = 0x01,
     Authorized = 0x02,
@@ -26,23 +26,23 @@ pub enum State {
 
 #[derive(Debug, PartialEq)]
 #[repr(u8)]
-enum CommandIdentifier {
+enum ImprovCommandIdentifier {
     WifiSettings = 0x01,
     GetCurrentState = 0x02,
     GetDeviceInfo = 0x03,
     GetWifiNetworks = 0x04
 }
 
-impl TryFrom<u8> for CommandIdentifier {
-    type Error = Error;
+impl TryFrom<u8> for ImprovCommandIdentifier {
+    type Error = ImprovError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0x01 => Ok(CommandIdentifier::WifiSettings),
-            0x02 => Ok(CommandIdentifier::GetCurrentState),
-            0x03 => Ok(CommandIdentifier::GetDeviceInfo),
-            0x04 => Ok(CommandIdentifier::GetWifiNetworks),
-            _ => Err(Error::UnknownRpc)
+            0x01 => Ok(ImprovCommandIdentifier::WifiSettings),
+            0x02 => Ok(ImprovCommandIdentifier::GetCurrentState),
+            0x03 => Ok(ImprovCommandIdentifier::GetDeviceInfo),
+            0x04 => Ok(ImprovCommandIdentifier::GetWifiNetworks),
+            _ => Err(ImprovError::UnknownRpc)
         }
     }
 }
@@ -58,11 +58,11 @@ pub enum ImprovCommand {
 impl ImprovCommand {
 
 
-    pub fn from_bytes(data: &[u8]) -> Result<ImprovCommand, Error> {
-        let cmd = CommandIdentifier::try_from(data[0])?;
+    pub fn from_bytes(data: &[u8]) -> Result<ImprovCommand, ImprovError> {
+        let cmd = ImprovCommandIdentifier::try_from(data[0])?;
 
         match cmd {
-            CommandIdentifier::WifiSettings => {
+            ImprovCommandIdentifier::WifiSettings => {
                 let ssid_length = data[2] as usize;
                 let ssid_start = 3;
                 let ssid_end= ssid_start + ssid_length;
@@ -71,14 +71,14 @@ impl ImprovCommand {
                 let pass_start = ssid_end + 1;
                 let pass_end = pass_start + pass_length;
 
-                let ssid = core::str::from_utf8(&data[ssid_start..ssid_end]).map(|x| String::from(x)).map_err(|_| Error::InvalidRpc)?;
-                let password = core::str::from_utf8(&data[pass_start..pass_end]).map(|x| String::from(x)).map_err(|_| Error::InvalidRpc)?;
+                let ssid = core::str::from_utf8(&data[ssid_start..ssid_end]).map(|x| String::from(x)).map_err(|_| ImprovError::InvalidRpc)?;
+                let password = core::str::from_utf8(&data[pass_start..pass_end]).map(|x| String::from(x)).map_err(|_| ImprovError::InvalidRpc)?;
 
                 Ok(ImprovCommand::WifiSettings { ssid, password })
             },
-            CommandIdentifier::GetDeviceInfo => Ok(ImprovCommand::GetDeviceInfo),
-            CommandIdentifier::GetCurrentState => Ok(ImprovCommand::GetCurrentState),
-            CommandIdentifier::GetWifiNetworks => Ok(ImprovCommand::GetWifiNetworks),
+            ImprovCommandIdentifier::GetDeviceInfo => Ok(ImprovCommand::GetDeviceInfo),
+            ImprovCommandIdentifier::GetCurrentState => Ok(ImprovCommand::GetCurrentState),
+            ImprovCommandIdentifier::GetWifiNetworks => Ok(ImprovCommand::GetWifiNetworks),
         }
     }
 }
@@ -89,6 +89,7 @@ pub const IMPROV_ERROR_UUID: &str = "00467768-6228-2272-4663-277478268002";
 pub const IMPROV_RPC_COMMAND_UUID: &str = "00467768-6228-2272-4663-277478268003";
 pub const IMPROV_RPC_RESULT_UUID: &str = "00467768-6228-2272-4663-277478268004";
 pub const IMPROV_CAPABILITIES_UUID: &str = "00467768-6228-2272-4663-277478268005";
+
 
 #[cfg(test)]
 mod tests {

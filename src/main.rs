@@ -1,16 +1,22 @@
 mod improv;
 mod wifi;
+mod kv;
 
 use esp_idf_sys as _; // If using the `binstart` feature of `esp-idf-sys`, always keep this module imported
 use log::*;
 use improv::*;
 use bluedroid::gatt_server::{Characteristic, GLOBAL_GATT_SERVER, Profile, Service};
 use bluedroid::utilities::{AttributePermissions, BleUuid, CharacteristicProperties};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use embedded_svc::wifi::Wifi;
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use crate::wifi::wifi;
+use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
+use esp_idf_sys::esp_restart;
+use crate::wifi::{EspMyceliumWifi, MyceliumWifiError, MyceliumWifi, WifiSettings};
+use heapless::String;
+use crate::kv::{KvStore, NvsKvsStore};
 
 fn main() -> ! {
     // It is necessary to call this function once. Otherwise some patches to the runtime
@@ -19,12 +25,36 @@ fn main() -> ! {
     // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    let state = Arc::new(RwLock::new(State::Authorized));
-    let state_read = state.clone();
-    let error = Arc::new(RwLock::new(Error::None));
-    let error_read = error.clone();
     let sysloop = EspSystemEventLoop::take().unwrap();
-    let peripherals = Peripherals::take().unwrap();
+    let nvs_partition = EspDefaultNvsPartition::take().unwrap();
+    let nvs = EspDefaultNvs::new(nvs_partition, "mycelium", true).unwrap();
+
+    let mut kv = NvsKvsStore::new(nvs);
+    let wifi_connector = EspMyceliumWifi::new(sysloop);
+
+
+    let wifi_settings: Option<WifiSettings> = kv.get("wifi_settings").unwrap();
+
+    match wifi_settings {
+        Some(s) => {
+            let _ = wifi_connector.connect(&s.ssid, &s.password).unwrap();
+        },
+        None => {
+            wifi_setup(wifi_connector, kv)
+        }
+    }
+
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wifi_setup(wifi_connector: EspMyceliumWifi, kv: NvsKvsStore) {
+    let state = Arc::new(RwLock::new(ImprovState::Authorized));
+    let state_read = state.clone();
+    let error = Arc::new(RwLock::new(ImprovError::None));
+    let error_read = error.clone();
+    let improv_handler = Arc::new(Mutex::new(ImprovHandler::new(wifi_connector, kv, error, state)));
 
     let current_state = Characteristic::new(BleUuid::from_uuid128_string(IMPROV_STATUS_UUID))
         .name("Current state")
@@ -37,8 +67,6 @@ fn main() -> ! {
             vec![ss.into()]
         })
         .build();
-
-
 
     let error_state = Characteristic::new(BleUuid::from_uuid128_string(IMPROV_ERROR_UUID))
         .name("Error state")
@@ -57,34 +85,8 @@ fn main() -> ! {
         .permissions(AttributePermissions::new().write())
         .properties(CharacteristicProperties::new().write())
         .on_write(move |bytes, _| {
-            match ImprovCommand::from_bytes(bytes.as_slice()) {
-                Ok(ImprovCommand::WifiSettings { ssid, password }) => {
-                    info!("Got ssid and password: {} {}", ssid, password);
-                    *state.write().unwrap() = State::Provisioning;
-                    *error.write().unwrap() = Error::None;
-                    match wifi(&ssid, &password, sysloop.clone()) {
-                        Ok(_) => {
-                            *state.write().unwrap() = State::Provisioned;
-                            info!("Connected")
-                        },
-                        Err(err) => {
-                            info!("Error {:?}", err);
-                            *error.write().unwrap() = Error::UnableToConnect;
-                            *state.write().unwrap() = State::Authorized;
-                            return ()
-                        }
-                    }
-                    return ()
-                }
-                Ok(cmd) => {
-                    info!("Command not processed {:?}", cmd);
-                    return ()
-                }
-                Err(err) => {
-                    info!("Error {:?}", err);
-                    return ()
-                }
-            }
+            improv_handler.lock().unwrap().handle(&bytes);
+
         })
         .show_name()
         .build();
@@ -129,9 +131,57 @@ fn main() -> ! {
         .appearance(bluedroid::utilities::Appearance::GenericComputer)
         .advertise_service(&service)
         .start();
-
-    loop {
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
+
+
+struct ImprovHandler<W, N> {
+    wifi: W,
+    settings: N,
+    error: Arc<RwLock<ImprovError>>,
+    state: Arc<RwLock<ImprovState>>
+}
+
+enum ImprovCommandResult<R> {
+    Connected(R)
+}
+
+impl <W, N> ImprovHandler<W, N> {
+
+    fn new<R>(esp_wifi: W, settings: N, error: Arc<RwLock<ImprovError>>, state: Arc<RwLock<ImprovState>>) -> ImprovHandler<W, N> where W : MyceliumWifi<R>, N : KvStore {
+        ImprovHandler { wifi: esp_wifi, settings, error, state }
+    }
+
+    fn handle<R>(&mut self, bytes: &Vec<u8>) where W : MyceliumWifi<R>, N : KvStore {
+        if let Some(cmd) = ImprovCommand::from_bytes(&bytes.as_slice()).ok() {
+            match cmd {
+                ImprovCommand::WifiSettings { ssid, password } => {
+                    *self.error.write().unwrap() = ImprovError::None;
+                    *self.state.write().unwrap() = ImprovState::Provisioning;
+
+                    match self.wifi.connect(&ssid, &password) {
+                        Ok(_) => {
+                            *self.state.write().unwrap() = ImprovState::Provisioned;
+                            self.settings.set("wifi_settings", WifiSettings { ssid, password}).unwrap();
+                            unsafe { esp_restart() }
+                        }
+                        Err(wifi_err) => {
+                            let err = match wifi_err {
+                                MyceliumWifiError::Esp(err) => ImprovError::Unknown,
+                                MyceliumWifiError::Timeout => ImprovError::UnableToConnect,
+                                MyceliumWifiError::NoIp => ImprovError::NotAuthorized,
+                            };
+                            *self.error.write().unwrap() = err;
+                            *self.state.write().unwrap() = ImprovState::Authorized;
+                        }
+                    };
+                },
+                _ => {
+                    *self.error.write().unwrap() = ImprovError::InvalidRpc;
+                }
+            }
+        } else {
+            *self.error.write().unwrap() = ImprovError::UnknownRpc;
+        }
+    }
+}

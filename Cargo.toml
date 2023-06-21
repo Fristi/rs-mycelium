@@ -29,6 +29,8 @@ embedded-svc = { version = "0.23"  }
 bluedroid = "0.3.7"
 heapless = "0.7.16"
 num_enum = "0.6.1"
+serde = "1.0.164"
+rmp-serde = "1.1.1"
 
 
 [build-dependencies]
